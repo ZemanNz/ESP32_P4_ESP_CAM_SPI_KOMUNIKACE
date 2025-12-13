@@ -1,0 +1,218 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "driver/spi_slave.h"
+#include "driver/gpio.h"
+#include "esp_camera.h"
+
+// ==========================================
+// 1. PINY PRO KAMERU (AI THINKER MODEL)
+// ==========================================
+#define CAM_PIN_PWDN 32
+#define CAM_PIN_RESET -1 //software reset will be performed
+#define CAM_PIN_XCLK 0
+#define CAM_PIN_SIOD 26
+#define CAM_PIN_SIOC 27
+
+#define CAM_PIN_D7 35
+#define CAM_PIN_D6 34
+#define CAM_PIN_D5 39
+#define CAM_PIN_D4 36
+#define CAM_PIN_D3 21
+#define CAM_PIN_D2 19
+#define CAM_PIN_D1 18
+#define CAM_PIN_D0 5
+#define CAM_PIN_VSYNC 25
+#define CAM_PIN_HREF 23
+#define CAM_PIN_PCLK 22
+
+// ==========================================
+// 2. PINY PRO SPI SLAVE (HSPI)
+// ==========================================
+#define GPIO_HANDSHAKE 2  // Červená LED na desce
+#define GPIO_MOSI      13
+#define GPIO_MISO      12  // Pozor na boot!
+#define GPIO_SCLK      14
+#define GPIO_CS        15
+
+#define RCV_HOST       SPI2_HOST // HSPI
+
+static const char *TAG = "CAM_SPI_TEST";
+
+// Konfigurace kamery
+static camera_config_t camera_config = {
+    .pin_pwdn = CAM_PIN_PWDN,
+    .pin_reset = CAM_PIN_RESET,
+    .pin_xclk = CAM_PIN_XCLK,
+    .pin_sccb_sda = CAM_PIN_SIOD,
+    .pin_sccb_scl = CAM_PIN_SIOC,
+
+    .pin_d7 = CAM_PIN_D7,
+    .pin_d6 = CAM_PIN_D6,
+    .pin_d5 = CAM_PIN_D5,
+    .pin_d4 = CAM_PIN_D4,
+    .pin_d3 = CAM_PIN_D3,
+    .pin_d2 = CAM_PIN_D2,
+    .pin_d1 = CAM_PIN_D1,
+    .pin_d0 = CAM_PIN_D0,
+    .pin_vsync = CAM_PIN_VSYNC,
+    .pin_href = CAM_PIN_HREF,
+    .pin_pclk = CAM_PIN_PCLK,
+
+    .xclk_freq_hz = 10000000, // 10 MHz je bezpečnější pro test
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_RGB565, 
+    .frame_size = FRAMESIZE_QVGA,    
+    .jpeg_quality = 12, 
+    .fb_count = 1,       
+    .fb_location = CAMERA_FB_IN_PSRAM,
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+};
+
+// --- SPI CALLBACKY ---
+// Když jsme připraveni (data jsou v DMA), zvedneme Handshake
+void my_post_setup_cb(spi_slave_transaction_t *trans) {
+    gpio_set_level(GPIO_HANDSHAKE, 1);
+}
+
+// Když přenos skončí, shodíme Handshake
+void my_post_trans_cb(spi_slave_transaction_t *trans) {
+    gpio_set_level(GPIO_HANDSHAKE, 0);
+}
+
+// Funkce pro start kamery
+static esp_err_t init_camera(void)
+{
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Camera Init Failed");
+        return err;
+    }
+    return ESP_OK;
+}
+
+void app_main(void)
+{
+    // 1. Inicializace Kamery
+    if(ESP_OK != init_camera()) {
+        return;
+    }
+    ESP_LOGI(TAG, "Camera initialized successfully");
+
+    // 2. Inicializace SPI Slave
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = GPIO_MOSI,
+        .miso_io_num = GPIO_MISO,
+        .sclk_io_num = GPIO_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+
+    spi_slave_interface_config_t slvcfg = {
+        .mode = 0,
+        .spics_io_num = GPIO_CS,
+        .queue_size = 3,
+        .flags = 0,
+        .post_setup_cb = my_post_setup_cb,
+        .post_trans_cb = my_post_trans_cb
+    };
+
+    // Konfigurace Handshake pinu (LED)
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << GPIO_HANDSHAKE),
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(GPIO_HANDSHAKE, 0);
+
+    // Pull-upy pro SPI
+    gpio_set_pull_mode(GPIO_MOSI, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(GPIO_SCLK, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(GPIO_CS, GPIO_PULLUP_ONLY);
+
+    // Start SPI
+    esp_err_t ret = spi_slave_initialize(RCV_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+    assert(ret == ESP_OK);
+    ESP_LOGI(TAG, "SPI Slave initialized on HSPI (12,13,14,15)");
+
+    // 3. Alokace bufferů pro text
+    char *sendbuf = heap_caps_malloc(129, MALLOC_CAP_DMA);
+    char *recvbuf = heap_caps_malloc(129, MALLOC_CAP_DMA);
+    
+    spi_slave_transaction_t t;
+    memset(&t, 0, sizeof(t));
+
+    int n = 0;
+
+    while (1)
+    {
+        // A. Vyčistit buffery
+        memset(recvbuf, 0, 129);
+        memset(sendbuf, 0, 129);
+
+        // B. (Volitelné) Vyfotit fotku jen pro kontrolu, že kamera žije
+        //    Zatím ji nikam neposíláme, jen ověříme, že to nespadne.
+        ESP_LOGI(TAG, "Taking dummy picture to check camera...");
+        camera_fb_t *pic = esp_camera_fb_get();
+        if (pic) {
+            ESP_LOGI(TAG, "Picture OK: %u bytes", pic->len);
+            esp_camera_fb_return(pic);
+        } else {
+            ESP_LOGE(TAG, "Camera capture failed");
+        }
+
+        // C. Připravit textovou zprávu pro P4
+        snprintf(sendbuf, 128, "Hello P4 from CAM module! Msg #%d", n);
+        
+        t.length = 128 * 8;
+        t.tx_buffer = sendbuf;
+        t.rx_buffer = recvbuf;
+
+        // D. Odeslat přes SPI
+        ESP_LOGI(TAG, "Queueing SPI transaction...");
+        ret = spi_slave_transmit(RCV_HOST, &t, portMAX_DELAY);
+
+        ESP_LOGI(TAG, "Transaction done. Master sent: %s", recvbuf);
+        n++;
+
+        // Malá pauza
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+
+
+
+// I (50474) CAM_SPI_TEST: Taking dummy picture to check camera...
+// I (50474) CAM_SPI_TEST: Picture OK: 153600 bytes
+// I (50474) CAM_SPI_TEST: Queueing SPI transaction...
+// I (51369) CAM_SPI_TEST: Transaction done. Master sent: ��������������������������������������������������������������������������������������������������������������������������������
+// I (51474) CAM_SPI_TEST: Taking dummy picture to check camera...
+// I (51474) CAM_SPI_TEST: Picture OK: 153600 bytes
+// I (51474) CAM_SPI_TEST: Queueing SPI transaction...
+// I (52369) CAM_SPI_TEST: Transaction done. Master sent: ��������������������������������������������������������������������������������������������������������������������������������
+// I (52474) CAM_SPI_TEST: Taking dummy picture to check camera...
+
+
+
+
+// Received HEX:    48 65 6C 6C
+// Waiting for Slave...
+// Sent: Msg 5 from P4
+// Received String: Hello P4 from CAM module! Msg #19
+// Received HEX:    48 65 6C 6C
+// Waiting for Slave...
+// Sent: Msg 6 from P4
+// Received String: Hello P4 from CAM module! Msg #20
+// Received HEX:    48 65 6C 6C
