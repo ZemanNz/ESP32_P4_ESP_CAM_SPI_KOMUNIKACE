@@ -1,0 +1,45 @@
+build/
+managed_components/
+**/squareline/backup/
+**/squareline/autosave/
+components/lvgl/
+
+# Soubory a složky generované ESP-IDF build systémem
+/build/
+/dist/
+
+# Lokální konfigurační soubory, které by neměly být ve verzování
+# Každý vývojář si je generuje sám
+/sdkconfig
+/sdkconfig.old
+
+# Soubory generované při kompilaci
+*.bin
+*.elf
+*.map
+*.part
+
+# Složky spravovaných komponent (pokud používáš idf_component.yml)
+/managed_components/
+
+# Soubory pro editory a IDE
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln
+*.project
+*.creator
+*.creator.user
+*.creator.shared
+*.DS_Store
+
+# Soubory pro ctags
+ctags
+.tags
+
+# Soubory pro code coverage
+*.gcno
+*.gcda
+/coverage/
+/README.md
