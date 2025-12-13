@@ -42,3 +42,4 @@ ctags
 *.gcno
 *.gcda
 /coverage/
+/README.md
