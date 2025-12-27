@@ -26,6 +26,8 @@ static const char *TAG = "P4_AUTO_SYNC";
 #define GPIO_MOSI           22
 #define GPIO_MISO           24
 #define GPIO_CS             25
+
+
 #define SENDER_HOST         SPI2_HOST
 
 #define IMG_WIDTH           160

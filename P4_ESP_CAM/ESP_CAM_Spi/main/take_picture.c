@@ -14,6 +14,8 @@
 #define GPIO_MISO      12
 #define GPIO_SCLK      14
 #define GPIO_CS        15
+
+
 #define RCV_HOST       SPI2_HOST
 
 // === NASTAVENÍ OBRAZU (QQVGA 160x120) ===
