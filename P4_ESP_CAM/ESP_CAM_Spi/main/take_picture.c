@@ -16,15 +16,15 @@
 #define GPIO_CS        15
 #define RCV_HOST       SPI2_HOST
 
-// === NOVÉ NASTAVENÍ OBRAZU (QQVGA) ===
-#define SCREEN_WIDTH   160   // <--- ZMĚNA
+// === NASTAVENÍ OBRAZU (QQVGA 160x120) ===
+#define SCREEN_WIDTH   160
 #define CHUNK_HEIGHT   20
 #define BYTES_PER_PIXEL 2
 // Velikost jednoho balíku: 160 * 20 * 2 = 6 400 Bajtů
 #define CHUNK_SIZE     (SCREEN_WIDTH * CHUNK_HEIGHT * BYTES_PER_PIXEL)
-#define TOTAL_CHUNKS   6     // 120 řádků / 20 = 6 kusů
+#define TOTAL_CHUNKS   6     
 
-static const char *TAG = "CAM_SENDER_QQVGA";
+static const char *TAG = "CAM_SYNC_SENDER";
 
 // Konfigurace kamery
 #define CAM_PIN_PWDN 32
@@ -51,12 +51,8 @@ static camera_config_t camera_config = {
     .pin_d4 = CAM_PIN_D4, .pin_d3 = CAM_PIN_D3, .pin_d2 = CAM_PIN_D2,
     .pin_d1 = CAM_PIN_D1, .pin_d0 = CAM_PIN_D0,
     .pin_vsync = CAM_PIN_VSYNC, .pin_href = CAM_PIN_HREF, .pin_pclk = CAM_PIN_PCLK,
-    
-    // --- ZMĚNY ZDE ---
-    .xclk_freq_hz = 10000000,         // Sníženo na 10 MHz (stabilita)
-    .frame_size = FRAMESIZE_QQVGA,    // Sníženo na 160x120
-    // -----------------
-    
+    .xclk_freq_hz = 10000000,         
+    .frame_size = FRAMESIZE_QQVGA,    
     .ledc_timer = LEDC_TIMER_0, .ledc_channel = LEDC_CHANNEL_0,
     .pixel_format = PIXFORMAT_RGB565, 
     .jpeg_quality = 12, .fb_count = 1, 
@@ -77,16 +73,13 @@ void app_main(void)
         return;
     }
 
-    // 2. Init SPI
+    // Init SPI
     spi_bus_config_t buscfg = {
         .mosi_io_num = GPIO_MOSI, 
         .miso_io_num = GPIO_MISO, 
         .sclk_io_num = GPIO_SCLK,
         .quadwp_io_num = -1, 
         .quadhd_io_num = -1,
-        
-        // !!! TOTO JE TA OPRAVA !!!
-        // Musí to být víc než CHUNK_SIZE (6400). Dáme 8192 (8KB).
         .max_transfer_sz = 8192, 
     };
     spi_slave_interface_config_t slvcfg = {
@@ -104,14 +97,15 @@ void app_main(void)
 
     spi_slave_initialize(RCV_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
 
-    // Buffery - nyní menší (6400 B)
+    // Buffery
     uint8_t *sendbuf = heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA);
     uint8_t *recvbuf = heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA);
     
-    spi_slave_transaction_t t;
+    // --- OPRAVA ZDE ---
+    spi_slave_transaction_t t; // Správný typ pro SLAVE
     memset(&t, 0, sizeof(t));
 
-    ESP_LOGI(TAG, "Streaming QQVGA (160x120) started...");
+    ESP_LOGI(TAG, "Streaming QQVGA (Sync Header Active)...");
 
     while (1) {
         camera_fb_t *pic = esp_camera_fb_get();
@@ -120,14 +114,91 @@ void app_main(void)
             continue;
         }
 
+        // --- Levý modrý a pravý zelený pruh ---
+        int vertical_stripe_width = 20;
+        for (int y = 0; y < pic->height; y++) {
+            // Levý modrý pruh
+            for (int x = 0; x < vertical_stripe_width; x++) {
+                int pixel_index = (y * pic->width + x) * BYTES_PER_PIXEL;
+                pic->buf[pixel_index] = 0x00; // Modrá (High)
+                pic->buf[pixel_index + 1] = 0x1F; // Modrá (Low)
+            }
+            // Pravý zelený pruh
+            for (int x = pic->width - vertical_stripe_width; x < pic->width; x++) {
+                int pixel_index = (y * pic->width + x) * BYTES_PER_PIXEL;
+                pic->buf[pixel_index] = 0x07; // Zelená (High)
+                pic->buf[pixel_index + 1] = 0xE0; // Zelená (Low)
+            }
+        }
+
+        // === DETEKCE BAREV UPROSTŘED ===
+        int box_size = 80;
+        int box_start_x = (pic->width / 2) - (box_size / 2);
+        int box_start_y = (pic->height / 2) - (box_size / 2);
+        int box_end_x = box_start_x + box_size;
+        int box_end_y = box_start_y + box_size;
+
+        #define RED_THRESHOLD 19
+        #define GREEN_THRESHOLD 28
+        #define BLUE_THRESHOLD 20
+
+        // Projít pixely v centrálním boxu
+        for (int y = box_start_y; y < box_end_y; y++) {
+            for (int x = box_start_x; x < box_end_x; x++) {
+                int pixel_index = (y * pic->width + x) * BYTES_PER_PIXEL;
+
+                // Vykreslit ohraničení bílou barvou
+                if (y == box_start_y || y == box_end_y - 1 || x == box_start_x || x == box_end_x - 1) {
+                    pic->buf[pixel_index] = 0xFF; // Bílá (High)
+                    pic->buf[pixel_index + 1] = 0xFF; // Bílá (Low)
+                    continue;
+                }
+
+                // Detekce barvy uvnitř ohraničení
+                uint16_t pixel_value = (pic->buf[pixel_index] << 8) | pic->buf[pixel_index + 1];
+
+                uint8_t r = (pixel_value >> 11) & 0x1F;
+                uint8_t g = (pixel_value >> 6) & 0x1F; // Vezmeme horních 5 bitů pro srovnání
+                uint8_t b = pixel_value & 0x1F;
+
+                if (r > g && r > b && r > RED_THRESHOLD) {
+                    // Převládá červená -> nahradit 100% červenou
+                    pic->buf[pixel_index] = 0xF8;
+                    pic->buf[pixel_index + 1] = 0x00;
+                } else if (g > r && g > b && g > GREEN_THRESHOLD) {
+                    // Převládá zelená -> nahradit 100% zelenou
+                    pic->buf[pixel_index] = 0x07;
+                    pic->buf[pixel_index + 1] = 0xE0;
+                } else if (b > r && b > g && b > BLUE_THRESHOLD) {
+                    // Převládá modrá -> nahradit 100% modrou
+                    pic->buf[pixel_index] = 0x00;
+                    pic->buf[pixel_index + 1] = 0x1F;
+                }
+                // Jinak ponechat původní barvu pixelu
+            }
+        }
+        #undef RED_THRESHOLD
+        #undef GREEN_THRESHOLD
+        #undef BLUE_THRESHOLD
+        // =================================
+
         size_t offset = 0;
-        // Odesíláme 6 chunků
+        
         for (int i = 0; i < TOTAL_CHUNKS; i++) {
             if (offset + CHUNK_SIZE <= pic->len) {
                 memcpy(sendbuf, pic->buf + offset, CHUNK_SIZE);
             } else {
                 memset(sendbuf, 0, CHUNK_SIZE);
             }
+
+            // === VLOŽENÍ HESLA (SYNC HEADER) ===
+            // Do prvního chunku vložíme AA CC, aby se P4 chytila
+            if (i == 0) {
+                sendbuf[0] = 0xAA;
+                sendbuf[1] = 0xCC;
+            }
+            // ===================================
+
             offset += CHUNK_SIZE;
 
             t.length = CHUNK_SIZE * 8;
@@ -136,8 +207,7 @@ void app_main(void)
 
             spi_slave_transmit(RCV_HOST, &t, portMAX_DELAY);
         }
-        // Vypíšeme velikost pro kontrolu (mělo by být cca 38400)
-        ESP_LOGI(TAG, "Frame sent. Bytes: %u", pic->len);
+        
         esp_camera_fb_return(pic);
     }
 }
