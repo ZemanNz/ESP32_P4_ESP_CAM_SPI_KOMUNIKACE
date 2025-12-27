@@ -66,6 +66,56 @@ void my_post_trans_cb(spi_slave_transaction_t *trans) {
     gpio_set_level(GPIO_HANDSHAKE, 0);
 }
 
+// === HSV KONVERZE ===
+typedef struct {
+    int h; // 0-360
+    int s; // 0-100
+    int v; // 0-100
+} hsv_color;
+
+hsv_color rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b) {
+    hsv_color hsv;
+    unsigned char min_val, max_val, delta;
+
+    min_val = (g < b) ? g : b;
+    min_val = (r < min_val) ? r : min_val;
+
+    max_val = (g > b) ? g : b;
+    max_val = (r > max_val) ? r : max_val;
+
+    hsv.v = (int)(((long)max_val * 100) / 255);
+    delta = max_val - min_val;
+
+    if (delta == 0) { // Achromatické (šedá)
+        hsv.h = 0;
+        hsv.s = 0;
+        return hsv;
+    }
+
+    if (max_val > 0) {
+        hsv.s = (int)(((long)delta * 100) / max_val);
+    } else { // Nemělo by nastat, pokud delta > 0
+        hsv.s = 0;
+        hsv.h = 0;
+        return hsv;
+    }
+    
+    long hue;
+    if (r >= max_val)
+        hue = (long)(g - b) * 60 / delta;
+    else if (g >= max_val)
+        hue = 120 + ((long)(b - r) * 60 / delta);
+    else
+        hue = 240 + ((long)(r - g) * 60 / delta);
+
+    if (hue < 0)
+        hue += 360;
+
+    hsv.h = (int)hue;
+    return hsv;
+}
+// ====================
+
 void app_main(void)
 {
     if (esp_camera_init(&camera_config) != ESP_OK) {
@@ -131,18 +181,33 @@ void app_main(void)
             }
         }
 
-        // === DETEKCE BAREV UPROSTŘED ===
+        // === DETEKCE BAREV (HSV) UPROSTŘED ===
         int box_size = 80;
         int box_start_x = (pic->width / 2) - (box_size / 2);
         int box_start_y = (pic->height / 2) - (box_size / 2);
         int box_end_x = box_start_x + box_size;
         int box_end_y = box_start_y + box_size;
 
-        #define RED_THRESHOLD 19
-        #define GREEN_THRESHOLD 28
-        #define BLUE_THRESHOLD 20
+        // --- Prahové hodnoty pro ČERVENOU ---
+        #define RED_HUE_MIN1 0
+        #define RED_HUE_MAX1 20
+        #define RED_HUE_MIN2 340
+        #define RED_HUE_MAX2 360
+        #define RED_SAT_MIN 35
+        #define RED_VAL_MIN 35
 
-        // Projít pixely v centrálním boxu
+        // --- Prahové hodnoty pro ZELENOU ---
+        #define GREEN_HUE_MIN 100
+        #define GREEN_HUE_MAX 140
+        #define GREEN_SAT_MIN 35
+        #define GREEN_VAL_MIN 35
+
+        // --- Prahové hodnoty pro MODROU ---
+        #define BLUE_HUE_MIN 220
+        #define BLUE_HUE_MAX 260
+        #define BLUE_SAT_MIN 35
+        #define BLUE_VAL_MIN 35
+
         for (int y = box_start_y; y < box_end_y; y++) {
             for (int x = box_start_x; x < box_end_x; x++) {
                 int pixel_index = (y * pic->width + x) * BYTES_PER_PIXEL;
@@ -154,33 +219,39 @@ void app_main(void)
                     continue;
                 }
 
-                // Detekce barvy uvnitř ohraničení
+                // 1. Získat RGB565 pixel
                 uint16_t pixel_value = (pic->buf[pixel_index] << 8) | pic->buf[pixel_index + 1];
 
-                uint8_t r = (pixel_value >> 11) & 0x1F;
-                uint8_t g = (pixel_value >> 6) & 0x1F; // Vezmeme horních 5 bitů pro srovnání
-                uint8_t b = pixel_value & 0x1F;
+                // 2. Převést RGB565 na RGB888
+                uint8_t r5 = (pixel_value >> 11) & 0x1F;
+                uint8_t g6 = (pixel_value >> 5) & 0x3F;
+                uint8_t b5 = pixel_value & 0x1F;
 
-                if (r > g && r > b && r > RED_THRESHOLD) {
-                    // Převládá červená -> nahradit 100% červenou
+                uint8_t r8 = (r5 * 255) / 31;
+                uint8_t g8 = (g6 * 255) / 63;
+                uint8_t b8 = (b5 * 255) / 31;
+
+                // 3. Převést RGB888 na HSV
+                hsv_color hsv = rgb_to_hsv(r8, g8, b8);
+
+                // 4. Detekce barvy podle Hue, Saturation a Value
+                if (((hsv.h >= RED_HUE_MIN1 && hsv.h <= RED_HUE_MAX1) || (hsv.h >= RED_HUE_MIN2 && hsv.h <= RED_HUE_MAX2)) && hsv.s > RED_SAT_MIN && hsv.v > RED_VAL_MIN) {
+                    // Červená
                     pic->buf[pixel_index] = 0xF8;
                     pic->buf[pixel_index + 1] = 0x00;
-                } else if (g > r && g > b && g > GREEN_THRESHOLD) {
-                    // Převládá zelená -> nahradit 100% zelenou
+                } else if ((hsv.h >= GREEN_HUE_MIN && hsv.h <= GREEN_HUE_MAX) && hsv.s > GREEN_SAT_MIN && hsv.v > GREEN_VAL_MIN) {
+                    // Zelená
                     pic->buf[pixel_index] = 0x07;
                     pic->buf[pixel_index + 1] = 0xE0;
-                } else if (b > r && b > g && b > BLUE_THRESHOLD) {
-                    // Převládá modrá -> nahradit 100% modrou
+                } else if ((hsv.h >= BLUE_HUE_MIN && hsv.h <= BLUE_HUE_MAX) && hsv.s > BLUE_SAT_MIN && hsv.v > BLUE_VAL_MIN) {
+                    // Modrá
                     pic->buf[pixel_index] = 0x00;
                     pic->buf[pixel_index + 1] = 0x1F;
                 }
-                // Jinak ponechat původní barvu pixelu
+                // Jinak ponechat původní barvu
             }
         }
-        #undef RED_THRESHOLD
-        #undef GREEN_THRESHOLD
-        #undef BLUE_THRESHOLD
-        // =================================
+        // =====================================
 
         size_t offset = 0;
         
